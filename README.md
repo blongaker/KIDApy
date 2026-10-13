@@ -148,6 +148,11 @@ Integrates $dx/dt = Ax + B(x \otimes x)$ with fixed $A$ and $B$ using `scipy.int
 t, y = solver.solve(A, B, t_span, x0, atol, rtol,
                     method="BDF", t_eval=None, scale=None)
 
+results = solver.solve_multiple(tensors, t_span, x0, atol, rtol,
+                                method="BDF", t_eval=None, scale=None,
+                                n_workers=1, verbose=False,
+                                return_failures=False)
+
 out, header = solver.save(path, t, y, col_names=None)
 
 fig, ax = solver.plot(t, y, indices, labels=None, outpath=None)

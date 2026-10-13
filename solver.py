@@ -47,6 +47,24 @@ def _tracer_mt_worker(task):
     return i, out
 
 
+# Module-level worker for QuadraticSolver.solve_multiple. The shared solve config is passed once per process via the pool initializer; each task carries its own (A, B) pair and x0.
+_MS_config = None
+
+
+def _solver_mt_init(config):
+    global _MS_config
+    _MS_config = config
+
+
+def _solver_mt_worker(task):
+    i, A, B, x0 = task
+    c = _MS_config
+    out = QuadraticSolver().solve(
+        A=A, B=B, t_span=c["t_span"], x0=x0, atol=c["atol"], rtol=c["rtol"],
+        method=c["method"], t_eval=c["t_eval"], scale=c["scale"])
+    return i, out
+
+
 def _make_jac(Acsr, B, N):
     """
     Build a ``jac(t, x)`` callable for J = A + B(x, ·) + B(·, x) whose sparsity structure is computed **once**.
@@ -350,6 +368,91 @@ class QuadraticSolver:
         if sol.status == 0:
             return sol.t, sol.y
         raise RuntimeError(f"Solver failed (status={sol.status}): {sol.message}")
+
+    def solve_multiple(
+        self,
+        tensors,
+        t_span: Tuple[float, float],
+        x0: np.ndarray,
+        atol: float,
+        rtol: float,
+        method: str = "BDF",
+        t_eval=None,
+        scale: np.ndarray = None,
+        n_workers: int = 1,
+        verbose: bool = False,
+        return_failures: bool = False,
+    ):
+        """
+        Solve many independent fixed-environment systems in parallel.
+
+        Each system is integrated with :meth:`solve`; parallelism is across systems using a process pool. All solve arguments other than ``A``, ``B`` and ``x0`` are shared across systems.  Parameters not listed below are passed through to :meth:`solve`.
+
+        Parameters
+        ----------
+        tensors : sequence of (A, B)
+            One operator pair per solve, e.g. ``[net.get_operators(env) for env in envs]``.
+        x0 : np.ndarray
+            Either one state vector (shape (N,), reused for every solve) or one per solve (shape (n_solves, N) or (N, n_solves)).
+        n_workers : int
+            Number of worker processes. ``1`` runs serially.
+        return_failures : bool
+            If ``True``, failed solves are stored as ``None`` and returned as ``(results, failures)`` with ``failures`` a list of ``(index, exception)``; otherwise the first failure is raised.
+
+        Returns
+        -------
+        results : list
+            ``(t, y)`` per solve, in input order (``None`` for failures when ``return_failures=True``).
+        failures : list, optional
+            Returned only when ``return_failures=True``.
+        """
+        tensors = list(tensors)
+        n = len(tensors)
+        x0_list = QuadraticSolverTracer._expand_initial_states(x0, n)
+        results = [None] * n
+        failures = []
+
+        kw = dict(t_span=t_span, atol=atol, rtol=rtol, method=method,
+                  t_eval=t_eval, scale=scale)
+
+        if int(n_workers) <= 1 or n <= 1:
+            for i in range(n):
+                A, B = tensors[i]
+                try:
+                    results[i] = self.solve(A=A, B=B, x0=x0_list[i], **kw)
+                except Exception as exc:
+                    if not return_failures:
+                        raise
+                    failures.append((i, exc))
+                    if verbose:
+                        print(f"[WARN] solve {i} failed: {exc}")
+            return (results, failures) if return_failures else results
+
+        with ProcessPoolExecutor(max_workers=int(n_workers),
+                                 initializer=_solver_mt_init,
+                                 initargs=(kw,)) as pool:
+            futures = {pool.submit(_solver_mt_worker, (i, *tensors[i], x0_list[i])): i
+                       for i in range(n)}
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                i = futures[fut]
+                try:
+                    j, out = fut.result()
+                    results[j] = out
+                except Exception as exc:
+                    if not return_failures:
+                        for other in futures:
+                            other.cancel()
+                        raise
+                    failures.append((i, exc))
+                    if verbose:
+                        print(f"\n[WARN] solve {i} failed: {exc}")
+                if verbose:
+                    print(f"  completed {done}/{n}", end="\r")
+            if verbose:
+                print()
+        return (results, failures) if return_failures else results
 
     # ------------------------------------------------------------------
     # Save and plot
@@ -748,7 +851,7 @@ class QuadraticSolverTracer:
 
     @staticmethod
     def _expand_initial_states(x0, n):
-        """One initial-abundance vector per tracer (a single vector is reused)."""
+        """One initial-abundance vector per solve (a single vector is reused)."""
         x0 = np.asarray(x0, dtype=np.float64)
         if x0.ndim == 1:
             return [x0.copy() for _ in range(n)]
@@ -757,7 +860,7 @@ class QuadraticSolverTracer:
                 return [x0[i].copy() for i in range(n)]
             if x0.shape[1] == n:
                 return [x0[:, i].copy() for i in range(n)]
-        raise ValueError(f"x0 must be one state vector or one per tracer; got {x0.shape} for {n}")
+        raise ValueError(f"x0 must be one state vector or one per solve; got {x0.shape} for {n}")
 
     def solve_multiple(
         self,
